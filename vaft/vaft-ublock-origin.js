@@ -46,6 +46,15 @@ twitch-videoad.js text/javascript
         scope.IsAdStrippingEnabled = true;
         scope.AdSegmentCache = new Map();
         scope.AllSegmentsAreAdSegments = false;
+        // --- Seamless Pipeline Options ---
+        scope.SeamlessPipeline = false;           // Master toggle: enables dual-video pipeline for instant ad-skip
+        scope.SeamlessPipelineAggressiveness = 2; // 1=manifest-only polling, 2=manifest+segment prefetch, 3=continuous segment fetch
+        scope.SeamlessPipelineMaxRes = null;      // null=match primary resolution, or e.g. "852x480" to cap backup
+        scope.SeamlessPipelinePollInterval = 4000;// Idle manifest poll interval (ms)
+        scope.SeamlessPipelineAdPollInterval = 2000; // Poll interval when ad detected on primary (ms)
+        scope.SeamlessPipelineAlignmentThresholdMs = 1500; // Max allowed live-edge drift before re-sync
+        scope.SeamlessPipelineSwapTransitionMs = 50;  // Opacity transition time (ms) for cross-fade
+        scope.SeamlessPipelineRetryBaseMs = 60000;    // Base retry delay on failure (ms), doubles each retry up to 5min
     }
     let isActivelyStrippingAds = false;
     let localStorageHookFailed = false;
@@ -191,6 +200,18 @@ twitch-videoad.js text/javascript
                         doTwitchPlayerTask(true, false);
                     } else if (e.data.key == 'ReloadPlayer') {
                         doTwitchPlayerTask(false, true);
+                    } else if (e.data.key == 'SeamlessSwapIn') {
+                        if (SeamlessPipeline && BackupPipeline.isReady()) {
+                            if (BackupPipeline.swapIn(e.data.serverTime)) {
+                                console.log('[VAFT Seamless] Instant swap-in successful');
+                            } else {
+                                console.log('[VAFT Seamless] Backup not ready, falling back to reactive path');
+                            }
+                        }
+                    } else if (e.data.key == 'SeamlessSwapOut') {
+                        if (SeamlessPipeline && BackupPipeline.state.isSwappedIn) {
+                            BackupPipeline.swapOut();
+                        }
                     }
                 });
                 this.addEventListener('message', async event => {
@@ -297,7 +318,8 @@ twitch-videoad.js text/javascript
                                         ActiveBackupPlayerType: null,
                                         IsMidroll: false,
                                         IsStrippingAdSegments: false,
-                                        NumStrippedAdSegments: 0
+                                        NumStrippedAdSegments: 0,
+                                        LastServerTime: null
                                     };
                                     const lines = encodingsM3u8.replaceAll('\r', '').split('\n');
                                     for (let i = 0; i < lines.length - 1; i++) {
@@ -455,6 +477,13 @@ twitch-videoad.js text/javascript
         if (!streamInfo) {
             return textStr;
         }
+        // Capture SERVER-TIME from sub-manifests for seamless pipeline alignment
+        try {
+            const subServerTime = textStr.match(/SERVER-TIME="([0-9.]+)"/);
+            if (subServerTime && subServerTime[1]) {
+                streamInfo.LastServerTime = subServerTime[1];
+            }
+        } catch (e) {}
         if (HasTriggeredPlayerReload) {
             HasTriggeredPlayerReload = false;
             streamInfo.LastPlayerReload = Date.now();
@@ -469,6 +498,12 @@ twitch-videoad.js text/javascript
                     isMidroll: streamInfo.IsMidroll,
                     hasAds: streamInfo.IsShowingAd,
                     isStrippingAdSegments: false
+                });
+                // Notify main thread to attempt seamless swap-in
+                postMessage({
+                    key: 'SeamlessSwapIn',
+                    channelName: streamInfo.ChannelName,
+                    serverTime: streamInfo.LastServerTime
                 });
             }
             if (!streamInfo.IsMidroll) {
@@ -588,6 +623,11 @@ twitch-videoad.js text/javascript
             streamInfo.IsStrippingAdSegments = false;
             streamInfo.NumStrippedAdSegments = 0;
             streamInfo.ActiveBackupPlayerType = null;
+            // Notify main thread to swap back from seamless pipeline
+            postMessage({
+                key: 'SeamlessSwapOut',
+                channelName: streamInfo.ChannelName
+            });
             if (streamInfo.IsUsingModifiedM3U8 || ReloadPlayerAfterAd) {
                 streamInfo.IsUsingModifiedM3U8 = false;
                 streamInfo.LastPlayerReload = Date.now();
@@ -927,6 +967,678 @@ twitch-videoad.js text/javascript
             };
         }
     }
+    // =========================================================================
+    // Seamless Pipeline — persistent secondary video pipeline for instant ad-skip
+    // =========================================================================
+    const BackupPipeline = {
+        state: {
+            channel: null,
+            status: 'idle',        // idle | initializing | warm | swapped | errored
+            videoEl: null,
+            mediaSource: null,
+            sourceBuffer: null,
+            backupPlayerType: null,
+            encodingsM3u8: null,
+            subManifestUrl: null,
+            serverTime: null,
+            lastPollTime: 0,
+            pollTimer: null,
+            fetchedSegments: new Set(),
+            isSwappedIn: false,
+            lastError: null,
+            retryCount: 0,
+            retryTimer: null,
+            initPromise: null,
+            primaryVideoRef: null,
+            mimeType: null,
+            appendQueue: [],
+            isAppending: false,
+            bufferCleanTimer: null
+        },
+        _resetState: function() {
+            this.state.channel = null;
+            this.state.status = 'idle';
+            this.state.videoEl = null;
+            this.state.mediaSource = null;
+            this.state.sourceBuffer = null;
+            this.state.backupPlayerType = null;
+            this.state.encodingsM3u8 = null;
+            this.state.subManifestUrl = null;
+            this.state.serverTime = null;
+            this.state.lastPollTime = 0;
+            this.state.pollTimer = null;
+            this.state.fetchedSegments = new Set();
+            this.state.isSwappedIn = false;
+            this.state.lastError = null;
+            this.state.retryCount = 0;
+            this.state.retryTimer = null;
+            this.state.initPromise = null;
+            this.state.primaryVideoRef = null;
+            this.state.mimeType = null;
+            this.state.appendQueue = [];
+            this.state.isAppending = false;
+            this.state.bufferCleanTimer = null;
+        },
+        init: function(channelName) {
+            if (!SeamlessPipeline) return;
+            // If already initialized for this channel, skip
+            if (this.state.channel === channelName && this.state.status !== 'errored') {
+                return;
+            }
+            // Tear down any existing pipeline (channel switch)
+            if (this.state.channel && this.state.channel !== channelName) {
+                console.log('[VAFT Seamless] Channel changed from ' + this.state.channel + ' to ' + channelName + ', reinitializing');
+                this.teardown();
+            }
+            if (this.state.status === 'initializing') return;
+            this.state.channel = channelName;
+            this.state.status = 'initializing';
+            console.log('[VAFT Seamless] Initializing backup pipeline for ' + channelName);
+            this.state.initPromise = this._doInit(channelName);
+        },
+        _doInit: async function(channelName) {
+            try {
+                // 1. Find a clean backup token/encodings
+                let encodingsM3u8 = null;
+                let backupPlayerType = null;
+                for (let i = 0; i < BackupPlayerTypes.length; i++) {
+                    const playerType = BackupPlayerTypes[i];
+                    const realPlayerType = playerType.replace('-CACHED', '');
+                    try {
+                        const headers = {
+                            'Client-ID': ClientID,
+                            'X-Device-Id': GQLDeviceID || '',
+                            'Authorization': AuthorizationHeader,
+                            ...(ClientIntegrityHeader && {'Client-Integrity': ClientIntegrityHeader}),
+                            ...(ClientVersion && {'Client-Version': ClientVersion}),
+                            ...(ClientSession && {'Client-Session-Id': ClientSession})
+                        };
+                        const body = {
+                            operationName: 'PlaybackAccessToken',
+                            variables: {
+                                isLive: true,
+                                login: channelName,
+                                isVod: false,
+                                vodID: "",
+                                playerType: realPlayerType,
+                                platform: realPlayerType == 'autoplay' ? 'android' : 'web'
+                            },
+                            extensions: {
+                                persistedQuery: {
+                                    version: 1,
+                                    sha256Hash: "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9"
+                                }
+                            }
+                        };
+                        const tokenResponse = await window.realFetch('https://gql.twitch.tv/gql', {
+                            method: 'POST',
+                            body: JSON.stringify(body),
+                            headers: headers
+                        });
+                        if (tokenResponse.status !== 200) continue;
+                        const tokenData = await tokenResponse.json();
+                        if (!tokenData?.data?.streamPlaybackAccessToken) continue;
+                        // Build usher URL — reuse primary's usher params if available
+                        let usherParams = '';
+                        const streamInfo = StreamInfos[channelName];
+                        if (streamInfo && streamInfo.UsherParams) {
+                            usherParams = streamInfo.UsherParams;
+                        }
+                        const usherUrl = new URL('https://usher.ttvnw.net/api/' + (V2API ? 'v2/' : '') + 'channel/hls/' + channelName + '.m3u8' + usherParams);
+                        usherUrl.searchParams.set('sig', tokenData.data.streamPlaybackAccessToken.signature);
+                        usherUrl.searchParams.set('token', tokenData.data.streamPlaybackAccessToken.value);
+                        const encodingsResponse = await window.realFetch(usherUrl.href);
+                        if (encodingsResponse.status !== 200) continue;
+                        const encodingsText = await encodingsResponse.text();
+                        if (!encodingsText || encodingsText.includes(AdSignifier)) {
+                            console.log('[VAFT Seamless] Backup playerType ' + playerType + ' has ads, trying next');
+                            continue;
+                        }
+                        encodingsM3u8 = encodingsText;
+                        backupPlayerType = playerType;
+                        break;
+                    } catch (err) {
+                        console.log('[VAFT Seamless] Token fetch failed for ' + playerType + ': ' + err);
+                    }
+                }
+                if (!encodingsM3u8) {
+                    throw new Error('No ad-free backup playerType found');
+                }
+                this.state.encodingsM3u8 = encodingsM3u8;
+                this.state.backupPlayerType = backupPlayerType;
+                // 2. Pick the right resolution sub-manifest URL
+                const targetResolution = this._getTargetResolution();
+                if (!targetResolution) {
+                    throw new Error('Could not determine target resolution');
+                }
+                // Parse encodings to find matching sub-manifest URL
+                const subManifestUrl = this._getStreamUrlForRes(encodingsM3u8, targetResolution);
+                if (!subManifestUrl) {
+                    throw new Error('Could not find sub-manifest URL for resolution ' + targetResolution.Resolution);
+                }
+                this.state.subManifestUrl = subManifestUrl;
+                // Extract SERVER-TIME from encodings
+                try {
+                    const stMatch = encodingsM3u8.match(/SERVER-TIME="([0-9.]+)"/);
+                    if (stMatch && stMatch[1]) {
+                        this.state.serverTime = stMatch[1];
+                    }
+                } catch (e) {}
+                // 3. Create hidden <video> element and MSE pipeline
+                this._createVideoElement();
+                await this._initMSE();
+                // 4. Fetch initial segments
+                await this._pollAndFetch();
+                this.state.status = 'warm';
+                this.state.retryCount = 0;
+                console.log('[VAFT Seamless] Backup pipeline warm for ' + channelName + ' (' + backupPlayerType + ')');
+                // 5. Start periodic polling
+                this._startPolling();
+                // 6. Start periodic buffer cleanup
+                this._startBufferCleanup();
+            } catch (err) {
+                console.log('[VAFT Seamless] Init failed: ' + err);
+                this.state.lastError = err;
+                this.state.status = 'errored';
+                this._scheduleRetry();
+            }
+        },
+        _getTargetResolution: function() {
+            // If SeamlessPipelineMaxRes is set, use that. Otherwise match primary.
+            if (SeamlessPipelineMaxRes) {
+                return {
+                    Resolution: SeamlessPipelineMaxRes,
+                    FrameRate: null,
+                    Codecs: 'avc'
+                };
+            }
+            // Try to get primary's current resolution from streamInfo
+            const streamInfo = StreamInfos[this.state.channel];
+            if (streamInfo && streamInfo.ResolutionList && streamInfo.ResolutionList.length > 0) {
+                // Pick the highest non-HEVC resolution (best visual quality on swap)
+                const nonHevc = streamInfo.ResolutionList.filter(r => r.Codecs && (r.Codecs.startsWith('avc') || r.Codecs.startsWith('av0')));
+                if (nonHevc.length > 0) {
+                    return nonHevc[0]; // Highest quality first
+                }
+                return streamInfo.ResolutionList[0];
+            }
+            // Fallback: use a reasonable default
+            return { Resolution: '1920x1080', FrameRate: null, Codecs: 'avc' };
+        },
+        _getStreamUrlForRes: function(encodingsM3u8, resolutionInfo) {
+            // Reuse the same logic as getStreamUrlForResolution but in main thread context
+            const lines = encodingsM3u8.replaceAll('\r', '').split('\n');
+            const [targetWidth, targetHeight] = resolutionInfo.Resolution.split('x').map(Number);
+            let matchedUrl = null;
+            let matchedFrameRate = false;
+            let closestUrl = null;
+            let closestDiff = Infinity;
+            for (let i = 0; i < lines.length - 1; i++) {
+                if (lines[i].startsWith('#EXT-X-STREAM-INF') && lines[i + 1].includes('.m3u8')) {
+                    const resMatch = lines[i].match(/RESOLUTION=(\d+x\d+)/);
+                    const frMatch = lines[i].match(/FRAME-RATE=([\d.]+)/);
+                    const codecMatch = lines[i].match(/CODECS="([^"]+)"/);
+                    if (resMatch) {
+                        const resolution = resMatch[1];
+                        const frameRate = frMatch ? frMatch[1] : null;
+                        const codecs = codecMatch ? codecMatch[1] : '';
+                        // Skip HEVC for backup (avoid codec mismatch issues)
+                        if (codecs.startsWith('hev') || codecs.startsWith('hvc')) {
+                            continue;
+                        }
+                        if (resolution === resolutionInfo.Resolution && (!matchedUrl || (!matchedFrameRate && frameRate == resolutionInfo.FrameRate))) {
+                            matchedUrl = lines[i + 1];
+                            matchedFrameRate = frameRate == resolutionInfo.FrameRate;
+                            if (matchedFrameRate) return matchedUrl;
+                        }
+                        const [w, h] = resolution.split('x').map(Number);
+                        const diff = Math.abs((w * h) - (targetWidth * targetHeight));
+                        if (diff < closestDiff) {
+                            closestUrl = lines[i + 1];
+                            closestDiff = diff;
+                        }
+                    }
+                }
+            }
+            return matchedUrl || closestUrl;
+        },
+        _createVideoElement: function() {
+            // Remove any existing backup video
+            const existing = document.querySelector('#vaft-seamless-backup');
+            if (existing) existing.remove();
+            const video = document.createElement('video');
+            video.id = 'vaft-seamless-backup';
+            video.muted = true;
+            video.autoplay = true;
+            video.playsInline = true;
+            video.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;opacity:0;pointer-events:none;z-index:-1;object-fit:contain;transition:opacity ' + SeamlessPipelineSwapTransitionMs + 'ms ease;';
+            // Insert into the video player container
+            const playerContainer = document.querySelector('.video-player .video-player__container');
+            if (playerContainer) {
+                playerContainer.style.position = 'relative';
+                playerContainer.appendChild(video);
+            } else {
+                // Fallback: insert into .video-player directly
+                const playerRoot = document.querySelector('.video-player');
+                if (playerRoot) {
+                    playerRoot.appendChild(video);
+                } else {
+                    throw new Error('Could not find .video-player container');
+                }
+            }
+            this.state.videoEl = video;
+            // Cache reference to primary video
+            this.state.primaryVideoRef = document.querySelector('.video-player video:not(#vaft-seamless-backup)');
+        },
+        _initMSE: function() {
+            return new Promise((resolve, reject) => {
+                try {
+                    const ms = new MediaSource();
+                    this.state.mediaSource = ms;
+                    this.state.videoEl.src = URL.createObjectURL(ms);
+                    ms.addEventListener('sourceopen', () => {
+                        try {
+                            // Determine MIME type — try common HLS MPEG-TS and fMP4 types
+                            const mimeTypes = [
+                                'video/mp2t; codecs="avc1.4d401f,mp4a.40.2"',
+                                'video/mp2t; codecs="avc1.64001f,mp4a.40.2"',
+                                'video/mp2t',
+                                'video/mp4; codecs="avc1.4d401f,mp4a.40.2"',
+                                'video/mp4; codecs="avc1.64001f,mp4a.40.2"'
+                            ];
+                            let selectedMime = null;
+                            for (const mime of mimeTypes) {
+                                if (MediaSource.isTypeSupported(mime)) {
+                                    selectedMime = mime;
+                                    break;
+                                }
+                            }
+                            if (!selectedMime) {
+                                reject(new Error('No supported MIME type for MSE SourceBuffer'));
+                                return;
+                            }
+                            this.state.mimeType = selectedMime;
+                            const sb = ms.addSourceBuffer(selectedMime);
+                            sb.mode = 'sequence';
+                            this.state.sourceBuffer = sb;
+                            sb.addEventListener('updateend', () => {
+                                this._processAppendQueue();
+                            });
+                            sb.addEventListener('error', (e) => {
+                                console.log('[VAFT Seamless] SourceBuffer error: ' + e);
+                            });
+                            console.log('[VAFT Seamless] MSE initialized with MIME: ' + selectedMime);
+                            resolve();
+                        } catch (err) {
+                            reject(err);
+                        }
+                    });
+                    ms.addEventListener('sourceended', () => {
+                        console.log('[VAFT Seamless] MediaSource ended');
+                    });
+                    ms.addEventListener('error', (e) => {
+                        console.log('[VAFT Seamless] MediaSource error: ' + e);
+                        reject(e);
+                    });
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        },
+        _appendSegment: function(data) {
+            this.state.appendQueue.push(data);
+            this._processAppendQueue();
+        },
+        _processAppendQueue: function() {
+            if (this.state.isAppending || this.state.appendQueue.length === 0) return;
+            if (!this.state.sourceBuffer || this.state.sourceBuffer.updating) return;
+            if (!this.state.mediaSource || this.state.mediaSource.readyState !== 'open') return;
+            this.state.isAppending = true;
+            const data = this.state.appendQueue.shift();
+            try {
+                this.state.sourceBuffer.appendBuffer(data);
+                // updateend handler will call _processAppendQueue again
+            } catch (err) {
+                console.log('[VAFT Seamless] appendBuffer error: ' + err);
+                this.state.isAppending = false;
+                // Try processing next in queue
+                if (this.state.appendQueue.length > 0) {
+                    setTimeout(() => this._processAppendQueue(), 100);
+                }
+            }
+            this.state.isAppending = false;
+        },
+        _pollAndFetch: async function() {
+            if (this.state.status === 'errored' || !this.state.subManifestUrl) return;
+            try {
+                const response = await window.realFetch(this.state.subManifestUrl);
+                if (response.status !== 200) {
+                    console.log('[VAFT Seamless] Sub-manifest fetch failed: ' + response.status);
+                    return;
+                }
+                const m3u8Text = await response.text();
+                // Check if backup itself has ads
+                if (m3u8Text.includes(AdSignifier)) {
+                    console.log('[VAFT Seamless] Backup stream has ads, invalidating cache');
+                    this.state.encodingsM3u8 = null; // Force re-negotiation on next poll
+                    // Try to re-negotiate with different player type
+                    if (this.state.status === 'warm') {
+                        this._reNegotiate();
+                    }
+                    return;
+                }
+                // Extract SERVER-TIME from sub-manifest
+                try {
+                    const stMatch = m3u8Text.match(/SERVER-TIME="([0-9.]+)"/);
+                    if (stMatch && stMatch[1]) {
+                        this.state.serverTime = stMatch[1];
+                    }
+                } catch (e) {}
+                // Parse segments and prefetch if aggressiveness >= 2
+                if (SeamlessPipelineAggressiveness >= 2) {
+                    const segmentUrls = this._parseSegmentUrls(m3u8Text);
+                    // Fetch the latest N segments not already cached
+                    const newSegments = segmentUrls.filter(u => !this.state.fetchedSegments.has(u));
+                    const toFetch = SeamlessPipelineAggressiveness >= 3 ? newSegments : newSegments.slice(-2);
+                    for (const segUrl of toFetch) {
+                        try {
+                            const segResponse = await window.realFetch(segUrl);
+                            if (segResponse.status === 200) {
+                                const segData = await segResponse.arrayBuffer();
+                                this._appendSegment(new Uint8Array(segData));
+                                this.state.fetchedSegments.add(segUrl);
+                            }
+                        } catch (err) {
+                            console.log('[VAFT Seamless] Segment fetch failed: ' + err);
+                        }
+                    }
+                }
+                this.state.lastPollTime = Date.now();
+            } catch (err) {
+                console.log('[VAFT Seamless] Poll error: ' + err);
+            }
+        },
+        _parseSegmentUrls: function(m3u8Text) {
+            const lines = m3u8Text.replaceAll('\r', '').split('\n');
+            const urls = [];
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (line.startsWith('#EXTINF') && i + 1 < lines.length) {
+                    const nextLine = lines[i + 1].trim();
+                    if (nextLine && !nextLine.startsWith('#')) {
+                        urls.push(nextLine);
+                    }
+                } else if (line.startsWith('#EXT-X-TWITCH-PREFETCH:')) {
+                    const prefetchUrl = line.substring('#EXT-X-TWITCH-PREFETCH:'.length).trim();
+                    if (prefetchUrl) {
+                        urls.push(prefetchUrl);
+                    }
+                }
+            }
+            return urls;
+        },
+        _reNegotiate: async function() {
+            console.log('[VAFT Seamless] Re-negotiating backup token');
+            // Re-run the token/manifest negotiation to get an ad-free backup
+            try {
+                const channelName = this.state.channel;
+                for (let i = 0; i < BackupPlayerTypes.length; i++) {
+                    const playerType = BackupPlayerTypes[i];
+                    const realPlayerType = playerType.replace('-CACHED', '');
+                    try {
+                        const headers = {
+                            'Client-ID': ClientID,
+                            'X-Device-Id': GQLDeviceID || '',
+                            'Authorization': AuthorizationHeader,
+                            ...(ClientIntegrityHeader && {'Client-Integrity': ClientIntegrityHeader}),
+                            ...(ClientVersion && {'Client-Version': ClientVersion}),
+                            ...(ClientSession && {'Client-Session-Id': ClientSession})
+                        };
+                        const body = {
+                            operationName: 'PlaybackAccessToken',
+                            variables: {
+                                isLive: true,
+                                login: channelName,
+                                isVod: false,
+                                vodID: "",
+                                playerType: realPlayerType,
+                                platform: realPlayerType == 'autoplay' ? 'android' : 'web'
+                            },
+                            extensions: {
+                                persistedQuery: {
+                                    version: 1,
+                                    sha256Hash: "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9"
+                                }
+                            }
+                        };
+                        const tokenResponse = await window.realFetch('https://gql.twitch.tv/gql', {
+                            method: 'POST',
+                            body: JSON.stringify(body),
+                            headers: headers
+                        });
+                        if (tokenResponse.status !== 200) continue;
+                        const tokenData = await tokenResponse.json();
+                        if (!tokenData?.data?.streamPlaybackAccessToken) continue;
+                        let usherParams = '';
+                        const streamInfo = StreamInfos[channelName];
+                        if (streamInfo && streamInfo.UsherParams) {
+                            usherParams = streamInfo.UsherParams;
+                        }
+                        const usherUrl = new URL('https://usher.ttvnw.net/api/' + (V2API ? 'v2/' : '') + 'channel/hls/' + channelName + '.m3u8' + usherParams);
+                        usherUrl.searchParams.set('sig', tokenData.data.streamPlaybackAccessToken.signature);
+                        usherUrl.searchParams.set('token', tokenData.data.streamPlaybackAccessToken.value);
+                        const encodingsResponse = await window.realFetch(usherUrl.href);
+                        if (encodingsResponse.status !== 200) continue;
+                        const encodingsText = await encodingsResponse.text();
+                        if (!encodingsText || encodingsText.includes(AdSignifier)) continue;
+                        this.state.encodingsM3u8 = encodingsText;
+                        this.state.backupPlayerType = playerType;
+                        const targetRes = this._getTargetResolution();
+                        const newSubUrl = this._getStreamUrlForRes(encodingsText, targetRes);
+                        if (newSubUrl) {
+                            this.state.subManifestUrl = newSubUrl;
+                            console.log('[VAFT Seamless] Re-negotiated with ' + playerType);
+                            return;
+                        }
+                    } catch (err) {}
+                }
+                console.log('[VAFT Seamless] Re-negotiation failed, all playerTypes have ads');
+            } catch (err) {
+                console.log('[VAFT Seamless] Re-negotiation error: ' + err);
+            }
+        },
+        _startPolling: function() {
+            if (this.state.pollTimer) {
+                clearInterval(this.state.pollTimer);
+            }
+            const interval = SeamlessPipelinePollInterval;
+            this.state.pollTimer = setInterval(() => {
+                if (this.state.status === 'warm' || this.state.status === 'swapped') {
+                    this._pollAndFetch();
+                }
+            }, interval);
+        },
+        _startBufferCleanup: function() {
+            if (this.state.bufferCleanTimer) {
+                clearInterval(this.state.bufferCleanTimer);
+            }
+            // Every 15 seconds, evict old buffer data to prevent memory growth
+            this.state.bufferCleanTimer = setInterval(() => {
+                this._cleanBuffer();
+            }, 15000);
+        },
+        _cleanBuffer: function() {
+            if (!this.state.sourceBuffer || this.state.sourceBuffer.updating) return;
+            if (!this.state.mediaSource || this.state.mediaSource.readyState !== 'open') return;
+            const video = this.state.videoEl;
+            if (!video || !video.buffered || video.buffered.length === 0) return;
+            try {
+                const currentTime = video.currentTime;
+                const bufferedStart = video.buffered.start(0);
+                // Keep 10 seconds behind current position, evict everything older
+                if (currentTime - bufferedStart > 15) {
+                    this.state.sourceBuffer.remove(bufferedStart, currentTime - 10);
+                }
+            } catch (err) {
+                // Ignore remove errors — buffer may be in an intermediate state
+            }
+            // Also prune the fetchedSegments set to prevent unbounded growth
+            if (this.state.fetchedSegments.size > 200) {
+                const entries = Array.from(this.state.fetchedSegments);
+                for (let i = 0; i < entries.length - 100; i++) {
+                    this.state.fetchedSegments.delete(entries[i]);
+                }
+            }
+        },
+        _scheduleRetry: function() {
+            if (this.state.retryTimer) {
+                clearTimeout(this.state.retryTimer);
+            }
+            const delay = Math.min(
+                SeamlessPipelineRetryBaseMs * Math.pow(2, this.state.retryCount),
+                300000 // 5 minute max
+            );
+            this.state.retryCount++;
+            console.log('[VAFT Seamless] Scheduling retry in ' + (delay / 1000) + 's (attempt ' + this.state.retryCount + ')');
+            this.state.retryTimer = setTimeout(() => {
+                if (this.state.channel && this.state.status === 'errored') {
+                    this.state.status = 'idle';
+                    this.init(this.state.channel);
+                }
+            }, delay);
+        },
+        computeAlignmentOffset: function(primaryServerTime) {
+            // Returns the offset in seconds between primary and backup live edges
+            const backupST = this.state.serverTime;
+            if (!primaryServerTime || !backupST) return 0;
+            return parseFloat(primaryServerTime) - parseFloat(backupST);
+        },
+        alignToPosition: function(primaryServerTime) {
+            const video = this.state.videoEl;
+            if (!video || !video.buffered || video.buffered.length === 0) return;
+            const offset = this.computeAlignmentOffset(primaryServerTime);
+            if (Math.abs(offset) > SeamlessPipelineAlignmentThresholdMs / 1000) {
+                console.log('[VAFT Seamless] Alignment offset too large (' + offset.toFixed(2) + 's), re-syncing');
+                // Jump to live edge of the backup
+                if (video.buffered.length > 0) {
+                    video.currentTime = video.buffered.end(video.buffered.length - 1) - 0.5;
+                }
+            } else if (Math.abs(offset) > 0.1) {
+                // Small adjustment — seek within buffer
+                video.currentTime = video.currentTime + offset;
+                console.log('[VAFT Seamless] Adjusted backup position by ' + offset.toFixed(2) + 's');
+            }
+        },
+        isReady: function() {
+            if (this.state.status !== 'warm') return false;
+            if (!this.state.videoEl) return false;
+            if (!this.state.videoEl.buffered || this.state.videoEl.buffered.length === 0) return false;
+            // Check we have at least 1 second of buffer
+            const video = this.state.videoEl;
+            const bufferedEnd = video.buffered.end(video.buffered.length - 1);
+            const bufferAhead = bufferedEnd - video.currentTime;
+            return bufferAhead >= 0.5;
+        },
+        swapIn: function(primaryServerTime) {
+            if (!this.isReady()) return false;
+            const primaryVideo = this.state.primaryVideoRef || document.querySelector('.video-player video:not(#vaft-seamless-backup)');
+            const backupVideo = this.state.videoEl;
+            if (!primaryVideo || !backupVideo) return false;
+            // 1. Align position to primary's live edge
+            this.alignToPosition(primaryServerTime);
+            // 2. Unmute backup and match volume
+            try {
+                backupVideo.muted = false;
+                backupVideo.volume = primaryVideo.volume;
+            } catch (e) {
+                // Chrome may block unmute if no user gesture — keep muted as fallback
+                console.log('[VAFT Seamless] Could not unmute backup (autoplay policy): ' + e);
+                // Still swap visually — user can manually unmute
+            }
+            // 3. Cross-fade: show backup, hide primary
+            backupVideo.style.opacity = '1';
+            backupVideo.style.pointerEvents = 'auto';
+            backupVideo.style.zIndex = '10';
+            primaryVideo.style.opacity = '0';
+            primaryVideo.style.pointerEvents = 'none';
+            // 4. Mute primary (don't pause — Worker needs it playing to detect ad-end)
+            primaryVideo.muted = true;
+            this.state.isSwappedIn = true;
+            this.state.status = 'swapped';
+            // Increase polling frequency during ad
+            if (this.state.pollTimer) {
+                clearInterval(this.state.pollTimer);
+            }
+            this.state.pollTimer = setInterval(() => {
+                this._pollAndFetch();
+            }, SeamlessPipelineAdPollInterval);
+            console.log('[VAFT Seamless] Swapped to backup pipeline');
+            return true;
+        },
+        swapOut: function() {
+            const primaryVideo = this.state.primaryVideoRef || document.querySelector('.video-player video:not(#vaft-seamless-backup)');
+            const backupVideo = this.state.videoEl;
+            if (!primaryVideo || !backupVideo) return;
+            // Reverse the swap
+            primaryVideo.style.opacity = '1';
+            primaryVideo.style.pointerEvents = 'auto';
+            primaryVideo.muted = false;
+            backupVideo.style.opacity = '0';
+            backupVideo.style.pointerEvents = 'none';
+            backupVideo.style.zIndex = '-1';
+            backupVideo.muted = true;
+            this.state.isSwappedIn = false;
+            this.state.status = 'warm';
+            // Restore idle polling rate
+            if (this.state.pollTimer) {
+                clearInterval(this.state.pollTimer);
+            }
+            this._startPolling();
+            console.log('[VAFT Seamless] Swapped back to primary');
+        },
+        teardown: function() {
+            console.log('[VAFT Seamless] Tearing down backup pipeline');
+            // Clear all timers
+            if (this.state.pollTimer) {
+                clearInterval(this.state.pollTimer);
+            }
+            if (this.state.retryTimer) {
+                clearTimeout(this.state.retryTimer);
+            }
+            if (this.state.bufferCleanTimer) {
+                clearInterval(this.state.bufferCleanTimer);
+            }
+            // If swapped in, swap back first
+            if (this.state.isSwappedIn) {
+                this.swapOut();
+            }
+            // Remove video element
+            if (this.state.videoEl) {
+                this.state.videoEl.pause();
+                this.state.videoEl.removeAttribute('src');
+                this.state.videoEl.load();
+                this.state.videoEl.remove();
+            }
+            // Close MediaSource
+            if (this.state.mediaSource && this.state.mediaSource.readyState === 'open') {
+                try {
+                    this.state.mediaSource.endOfStream();
+                } catch (e) {}
+            }
+            this._resetState();
+        }
+    };
+    // Debug hook: expose backup pipeline status
+    window.seamlessPipelineStatus = () => {
+        console.log('[VAFT Seamless] Status: ' + BackupPipeline.state.status
+            + ' | Channel: ' + BackupPipeline.state.channel
+            + ' | PlayerType: ' + BackupPipeline.state.backupPlayerType
+            + ' | SwappedIn: ' + BackupPipeline.state.isSwappedIn
+            + ' | Segments: ' + BackupPipeline.state.fetchedSegments.size
+            + ' | ServerTime: ' + BackupPipeline.state.serverTime
+        );
+        return BackupPipeline.state;
+    };
     function hookFetch() {
         const realFetch = window.fetch;
         window.realFetch = realFetch;
@@ -978,6 +1690,17 @@ twitch-videoad.js text/javascript
                             init.body = JSON.stringify(newBody);
                         }
                     }
+                }
+            }
+            // Seamless pipeline: detect channel from usher URL and init backup
+            if (SeamlessPipeline && typeof url === 'string' && url.includes('/channel/hls/') && !url.includes('picture-by-picture') && !url.includes('seamless-backup')) {
+                try {
+                    const seamlessChannelMatch = (new URL(url)).pathname.match(/([^\/]+)(?=\.\w+$)/);
+                    if (seamlessChannelMatch && seamlessChannelMatch[0]) {
+                        BackupPipeline.init(seamlessChannelMatch[0]);
+                    }
+                } catch (e) {
+                    console.log('[VAFT Seamless] Failed to parse channel from usher URL: ' + e);
                 }
             }
             return realFetch.apply(this, arguments);
